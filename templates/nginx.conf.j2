@@ -1,0 +1,44 @@
+events {
+    worker_connections 1024;
+}
+
+http {
+    # Custom logging format required by the brief
+    log_format swiftdeploy '$time_iso8601 | $status | ${request_time}s | $upstream_addr | $request';
+    access_log /var/log/nginx/access.log swiftdeploy;
+
+    upstream backend {
+        server api:{{ manifest.services.port }};
+    }
+
+    server {
+        listen {{ manifest.nginx.port }};
+
+        # Timeouts injected from manifest
+        proxy_connect_timeout {{ manifest.nginx.proxy_timeout }};
+        proxy_read_timeout {{ manifest.nginx.proxy_timeout }};
+        proxy_send_timeout {{ manifest.nginx.proxy_timeout }};
+
+        location / {
+            proxy_pass http://backend;
+            
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            
+            # Custom Header
+            add_header X-Deployed-By "swiftdeploy" always;
+            
+            # Forward X-Mode (Nginx passes upstream headers by default, but this ensures it)
+            proxy_pass_header X-Mode;
+        }
+
+        # Intercept gateway errors to return custom JSON
+        error_page 502 503 504 /custom_error;
+        
+        location = /custom_error {
+            internal;
+            default_type application/json;
+            return 503 '{"error": "Upstream Service Unavailable", "code": "$status", "service": "swiftdeploy-api", "contact": "devops@swiftdeploy.local"}';
+        }
+    }
+}
