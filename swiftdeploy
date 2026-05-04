@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+import argparse
+import yaml
+import os
+import sys
+import socket
+import subprocess
+import time
+import urllib.request
+from jinja2 import Environment, FileSystemLoader
+
+MANIFEST_FILE = "manifest.yaml"
+
+def load_manifest():
+    if not os.path.exists(MANIFEST_FILE):
+        print("❌ Error: manifest.yaml not found.")
+        sys.exit(1)
+    try:
+        with open(MANIFEST_FILE, "r") as f:
+            return yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        print(f"❌ Error parsing manifest.yaml: {e}")
+        sys.exit(1)
+
+def save_manifest(manifest_data):
+    with open(MANIFEST_FILE, "w") as f:
+        # sort_keys=False prevents PyYAML from scrambling your file structure
+        yaml.dump(manifest_data, f, default_flow_style=False, sort_keys=False)
+
+def init(args):
+    print("⚙️  Running init: Generating configurations...")
+    manifest = load_manifest()
+    
+    env = Environment(loader=FileSystemLoader("templates"))
+    
+    # Render docker-compose.yml
+    compose_template = env.get_template("docker-compose.yml.j2")
+    with open("docker-compose.yml", "w") as f:
+        f.write(compose_template.render(manifest=manifest, mode=manifest.get("mode", "stable")))
+        
+    # Render nginx.conf
+    nginx_template = env.get_template("nginx.conf.j2")
+    with open("nginx.conf", "w") as f:
+        f.write(nginx_template.render(manifest=manifest))
+        
+    print("✅ Configuration files generated successfully.")
+
+def validate(args):
+    print("🔍 Running pre-flight checks...")
+    manifest = load_manifest()
+    passed = True
+
+    # 1. Required fields
+    try:
+        image = manifest["services"]["image"]
+        port = manifest["services"]["port"]
+        nx_image = manifest["nginx"]["image"]
+        nx_port = manifest["nginx"]["port"]
+        print("✅ Required fields are present.")
+    except KeyError as e:
+        print(f"❌ Missing required field in manifest: {e}")
+        passed = False
+
+    # 2. Docker image exists locally
+    result = subprocess.run(["docker", "image", "inspect", image], capture_output=True)
+    if result.returncode == 0:
+        print(f"✅ Docker image '{image}' exists locally.")
+    else:
+        print(f"❌ Docker image '{image}' not found locally.")
+        passed = False
+
+    # 3. Nginx port not bound
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    result = sock.connect_ex(('127.0.0.1', nx_port))
+    sock.close()
+    if result == 0:
+        print(f"❌ Port {nx_port} is already in use on the host.")
+        passed = False
+    else:
+        print(f"✅ Port {nx_port} is free.")
+
+    # 4. Nginx syntax validation
+    if not os.path.exists("nginx.conf"):
+        print("⚠️  nginx.conf not found. Running 'init' to generate it for validation...")
+        init(None)
+        
+    print("⏳ Validating nginx.conf syntax via Docker...")
+    nx_check = subprocess.run(
+        ["docker", "run", "--rm", "--add-host", "api:127.0.0.1", "-v", f"{os.path.abspath('nginx.conf')}:/etc/nginx/nginx.conf:ro", nx_image, "nginx", "-t"],
+        capture_output=True, text=True
+    )
+    if nx_check.returncode == 0:
+        print("✅ Nginx configuration syntax is valid.")
+    else:
+        print(f"❌ Nginx configuration syntax error:\n{nx_check.stderr}")
+        passed = False
+
+    if not passed:
+        print("\n🚨 Validation FAILED. Please fix the errors above.")
+        sys.exit(1)
+    print("\n🚀 All pre-flight checks PASSED.")
+
+def wait_for_healthz(port, timeout=60):
+    print(f"⏳ Waiting for health checks to pass (Timeout: {timeout}s)...")
+    start_time = time.time()
+    url = f"http://127.0.0.1:{port}/healthz"
+    
+    while time.time() - start_time < timeout:
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=2) as response:
+                if response.getcode() == 200:
+                    print("✅ Stack is HEALTHY and accepting traffic.")
+                    return True
+        except Exception:
+            pass
+        time.sleep(2)
+        print(".", end="", flush=True)
+        
+    print("\n❌ Health check timeout reached. Stack failed to become healthy.")
+    sys.exit(1)
+
+def deploy(args):
+    init(args)
+    manifest = load_manifest()
+    print("🚀 Bringing up the stack...")
+    subprocess.run(["docker", "compose", "up", "-d"], check=True)
+    wait_for_healthz(manifest["nginx"]["port"])
+
+def promote(args):
+    target_mode = args.mode
+    manifest = load_manifest()
+    
+    if manifest.get("mode") == target_mode:
+        print(f"⚠️  Stack is already in '{target_mode}' mode.")
+        return
+
+    print(f"🔄 Promoting stack to '{target_mode}' mode...")
+    
+    # Update manifest in-place
+    manifest["mode"] = target_mode
+    save_manifest(manifest)
+    
+    # Regenerate configs
+    init(args)
+    
+    # Restart ONLY the API container (Zero-downtime rolling restart)
+    print("🐳 Restarting API service container...")
+    subprocess.run(["docker", "compose", "up", "-d", "--no-deps", "api"], check=True)
+    
+    wait_for_healthz(manifest["nginx"]["port"])
+    print(f"🎉 Promotion to {target_mode} successful!")
+
+def teardown(args):
+    print("🧨 Tearing down the stack...")
+    subprocess.run(["docker", "compose", "down", "-v"])
+    
+    if args.clean:
+        print("🧹 Cleaning up generated configuration files...")
+        for file in ["docker-compose.yml", "nginx.conf"]:
+            if os.path.exists(file):
+                os.remove(file)
+                print(f"Deleted {file}")
+    print("✅ Teardown complete.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="SwiftDeploy - The Tool That Builds The Stack")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Init
+    subparsers.add_parser("init", help="Generate configs from manifest")
+
+    # Validate
+    subparsers.add_parser("validate", help="Run pre-flight checks")
+
+    # Deploy
+    subparsers.add_parser("deploy", help="Initialize and bring up the stack")
+
+    # Promote
+    promote_parser = subparsers.add_parser("promote", help="Switch deployment mode")
+    promote_parser.add_argument("mode", choices=["canary", "stable"], help="Target mode")
+
+    # Teardown
+    teardown_parser = subparsers.add_parser("teardown", help="Destroy the stack")
+    teardown_parser.add_argument("--clean", action="store_true", help="Delete generated config files")
+
+    args = parser.parse_args()
+
+    if args.command == "init":
+        init(args)
+    elif args.command == "validate":
+        validate(args)
+    elif args.command == "deploy":
+        deploy(args)
+    elif args.command == "promote":
+        promote(args)
+    elif args.command == "teardown":
+        teardown(args)
