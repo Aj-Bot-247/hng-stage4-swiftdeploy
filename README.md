@@ -12,7 +12,7 @@ SwiftDeploy is a declarative Infrastructure as Code (IaC) CLI tool designed to p
 2. Ensure Docker and Docker Compose are installed and running.
 3. Build the base application image:
    ```bash
-   docker build -t swift-deploy-1-node:latest . 
+   docker build -t aj-bot-api:latest . 
    ```
 4. Install CLI dependencies:
    ```bash
