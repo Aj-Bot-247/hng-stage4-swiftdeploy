@@ -1,4 +1,4 @@
-mode: canary
+mode: stable
 services:
   image: aj-bot-api:latest
   port: 5000

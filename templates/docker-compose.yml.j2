@@ -3,6 +3,8 @@ version: "3.8"
 services:
   api:
     image: {{ manifest.services.image }}
+    ports:
+      - "5000:5000"
     user: "appuser"
     cap_drop:
       - ALL
@@ -33,6 +35,22 @@ services:
       api:
         condition: service_healthy
     restart: always
+
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: swiftdeploy_opa
+    ports:
+      - "8282:8181" # Exposes OPA to the host so the CLI can query it
+    volumes:
+      - ./policies:/policies # Mounts the policies directory into the container
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181" # Forces OPA to accept external traffic
+      - "--log-level=debug"    # Forces OPA to log EVERY single request and error
+      - "/policies"
+    networks:
+      - {{ manifest.network.name }}
 
 networks:
   {{ manifest.network.name }}:
